@@ -15,6 +15,7 @@ from config import config
 
 app = FastAPI(title="Clap CNN Inference API")
 
+
 def load_mono(path: Path, sr: int) -> torch.Tensor:
     wav, in_sr = torchaudio.load(str(path))
     if in_sr != sr:
@@ -58,11 +59,12 @@ def make_windows(x: torch.Tensor, sr: int, win_s: float, hop_s: float):
     windows = []
     t = 0
     while t + win <= T:
-        windows.append((t / sr, x[:, t : t + win]))
+        windows.append((t / sr, x[:, t: t + win]))
         t += hop
     if windows and windows[-1][0] * sr + win < T:
-        windows.append(((T - win) / sr, x[:, T - win : T]))
+        windows.append(((T - win) / sr, x[:, T - win: T]))
     return windows
+
 
 class ClassProb(BaseModel):
     label: str
@@ -95,9 +97,9 @@ DEFAULT_CKPT_PATH = Path(os.getenv("CKPT_PATH", "best_clap_cnn.pt"))
 
 
 def infer_path(
-    wav_path: Path,
-    ckpt_path: Path = DEFAULT_CKPT_PATH,
-    threshold: float = DEFAULT_THRESHOLD,
+        wav_path: Path,
+        ckpt_path: Path = DEFAULT_CKPT_PATH,
+        threshold: float = DEFAULT_THRESHOLD,
 ):
     ckpt = torch.load(str(ckpt_path), map_location=config.device)
     model = SmallCNN(config.n_mels, 2).to(config.device)
@@ -146,7 +148,8 @@ def infer_path(
         "best_probs": best_probs,
     }
 
-@app.post("/predict", response_model=PredictResponse)
+
+@app.post("/predict")
 async def predict_file(file: UploadFile = File(...), top_k: int = 2):
     if top_k <= 0:
         raise HTTPException(status_code=400, detail="top_k must be >= 1")
