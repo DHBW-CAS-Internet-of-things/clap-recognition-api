@@ -82,16 +82,6 @@ class TimelineEntry(BaseModel):
     p_noise: float
 
 
-class PredictResponse(BaseModel):
-    filename: str
-    label2idx: Dict[str, int]
-    clap_idx: int
-    threshold: float
-    best: BestWindow
-    top_k: List[ClassProb]
-    timeline: List[TimelineEntry]
-    num_windows: int
-
 DEFAULT_THRESHOLD = 0.5
 DEFAULT_CKPT_PATH = Path(os.getenv("CKPT_PATH", "best_clap_cnn.pt"))
 
@@ -197,17 +187,8 @@ async def predict_file(file: UploadFile = File(...), top_k: int = 2):
     )[:k]
 
     top_models = [ClassProb(**t) for t in top]
+    return result["best"]
 
-    return PredictResponse(
-        filename=file.filename or "uploaded.wav",
-        label2idx=label2idx,
-        clap_idx=result["clap_idx"],
-        threshold=result["threshold"],
-        best=result["best"],
-        top_k=top_models,
-        timeline=result["timeline"],
-        num_windows=result["num_windows"],
-    )
 
 if __name__ == "__main__":
     import uvicorn
