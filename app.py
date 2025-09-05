@@ -1,275 +1,238 @@
-import base64
-import io
+# app.py
+import os
+import math
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from tempfile import NamedTemporaryFile
+from typing import Dict, List
+
+import numpy as np
 import torch
-import torch.nn as nn
 import torchaudio
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel
 
-BASE = Path(__file__).resolve().parent
-CKPT_PATH = BASE / "best_clap_cnn.pt" # path to the .pt file
+from cnn import SmallCNN
+from config import config
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+app = FastAPI(title="Clap CNN Inference API")
 
-app = FastAPI(title="Clap CNN Inference")
-
-# ----------------------------- Utilities ----------------------------- #
-
-
-def _strip_module_prefix(sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    # Handle checkpoints saved with DataParallel ('module.' prefix)
-    if any(k.startswith("module.") for k in sd.keys()):
-        return {k.split("module.", 1)[1]: v for k, v in sd.items()}
-    return sd
-
-
-def _infer_conv_channels(sd: Dict[str, torch.Tensor]) -> List[int]:
-    """
-    Find conv layers under 'features.*.weight' with 4D tensors and return
-    their out_channels in ascending index order. E.g., [16, 32, 64].
-    """
-    conv_entries = []
-    for k, v in sd.items():
-        if not k.startswith("features."):
-            continue
-        if not k.endswith(".weight"):
-            continue
-        if v.ndim == 4:  # Conv2d weight: [out, in, kH, kW]
-            try:
-                idx = int(k.split(".")[1])
-            except Exception:
-                continue
-            conv_entries.append((idx, v.shape[0]))
-    conv_entries.sort(key=lambda x: x[0])
-    channels = [c for _, c in conv_entries]
-    if not channels:
-        raise RuntimeError("Could not infer conv channels from state_dict.")
-    return channels
-
-
-class CompatSmallCNN(nn.Module):
-    """
-    Minimal CNN that matches the checkpoint's parameter names and shapes:
-    features: (Conv2d -> BN -> ReLU -> MaxPool2d) repeated per block
-    Then AdaptiveAvgPool2d to (1,1) and Linear to num_classes.
-    """
-
-    def __init__(self, channels: List[int], num_classes: int):
-        super().__init__()
-        assert len(channels) >= 1
-        layers: List[nn.Module] = []
-        in_ch = 1
-        for out_ch in channels:
-            layers.append(nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1))
-            layers.append(nn.BatchNorm2d(out_ch))
-            layers.append(nn.ReLU(inplace=True))
-            layers.append(nn.MaxPool2d(kernel_size=2, stride=2))
-            in_ch = out_ch
-        layers.append(nn.AdaptiveAvgPool2d((1, 1)))
-        self.features = nn.Sequential(*layers)
-        self.classifier = nn.Linear(channels[-1], num_classes)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.features(x)
-        x = torch.flatten(x, 1)
-        return self.classifier(x)
-
-
-def _load_checkpoint_and_model(
-    ckpt_path: Path,
-) -> Tuple[nn.Module, dict, Optional[List[str]]]:
-    if not ckpt_path.exists():
-        raise RuntimeError(f"Checkpoint not found: {ckpt_path}")
-
-    raw = torch.load(str(ckpt_path), map_location=DEVICE)
-    if not isinstance(raw, dict) or "model" not in raw:
-        raise RuntimeError("Expected a checkpoint dict with keys: ['model', 'cfg'].")
-
-    cfg = raw.get("cfg", {})
-    sd = raw["model"]
-    sd = _strip_module_prefix(sd)
-
-    # Infer channels from conv weights and classes from classifier weight
-    channels = _infer_conv_channels(sd)
-    if "classifier.weight" in sd:
-        num_classes = sd["classifier.weight"].shape[0]
-    else:
-        num_classes = cfg.get("num_classes") or len(cfg.get("labels", [])) or 2
-
-    model = CompatSmallCNN(channels=channels, num_classes=num_classes)
-    model.load_state_dict(sd, strict=True)
-    model.to(DEVICE).eval()
-
-    labels = cfg.get("labels")
-    return model, cfg, labels
-
-
-# Preprocessing builders from cfg
-_resamplers: Dict[Tuple[int, int], torchaudio.transforms.Resample] = {}
-
-
-def _get_resampler(src: int, dst: int):
-    if src == dst:
-        return None
-    key = (src, dst)
-    if key not in _resamplers:
-        _resamplers[key] = torchaudio.transforms.Resample(
-            orig_freq=src, new_freq=dst
-        )
-    return _resamplers[key]
-
-
-def _build_mel_and_db(c: dict):
-    sr = c.get("sr", 16000)
-    mel = torchaudio.transforms.MelSpectrogram(
-        sample_rate=sr,
-        n_fft=c.get("n_fft", 1024),
-        win_length=c.get("win_length", c.get("n_fft", 1024)),
-        hop_length=c.get("hop_length", 256),
-        f_min=c.get("fmin", 0),
-        f_max=c.get("fmax", sr // 2),
-        n_mels=c.get("n_mels", 64),
-        power=c.get("power", 2.0),
-        center=True,
-        pad_mode="reflect",
-        norm=None,
-        mel_scale="htk",
-    )
-    db = torchaudio.transforms.AmplitudeToDB(
-        stype="power", top_db=c.get("top_db", 80)
-    )
-    return mel, db
-
-
-def _wav_bytes_to_waveform(b: bytes, expected_sr: int) -> torch.Tensor:
-    try:
-        wav, sr = torchaudio.load(io.BytesIO(b))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Audio decode error: {e}")
-    if wav.dim() == 2 and wav.size(0) > 1:
-        wav = wav.mean(dim=0, keepdim=True)
-    elif wav.dim() == 1:
-        wav = wav.unsqueeze(0)
-    rs = _get_resampler(sr, expected_sr)
-    if rs is not None:
-        wav = rs(wav)
+# --------------------
+# Audio + feature transforms (same as script)
+# --------------------
+def load_mono(path: Path, sr: int) -> torch.Tensor:
+    wav, in_sr = torchaudio.load(str(path))
+    if in_sr != sr:
+        wav = torchaudio.functional.resample(wav, in_sr, sr)
+    wav = wav.mean(dim=0, keepdim=True)
     return wav
 
 
-def _waveform_to_input(
-    wav: torch.Tensor, c: dict, mel_tx, db_tx
-) -> torch.Tensor:
-    x = mel_tx(wav)
-    x = db_tx(x)
-
-    mm, ms = c.get("mel_mean"), c.get("mel_std")
-    if mm is not None and ms is not None:
-        mm_t = torch.tensor(mm, device=x.device, dtype=x.dtype)
-        ms_t = torch.tensor(ms, device=x.device, dtype=x.dtype)
-        x = (x - mm_t) / (ms_t + 1e-6)
-    else:
-        x = (x - x.mean()) / (x.std(unbiased=False) + 1e-6)
-
-    target_frames = c.get("target_frames")
-    if target_frames is None and c.get("target_sec") is not None:
-        target_frames = int(
-            c["target_sec"] * c.get("sr", 16000) / c.get("hop_length", 256)
-        )
-    if target_frames is not None:
-        T = x.size(-1)
-        if T < target_frames:
-            pad = target_frames - T
-            x = torch.nn.functional.pad(x, (0, pad), value=0.0)
-        elif T > target_frames:
-            x = x[..., target_frames]
-
-    if x.dim() == 3:
-        x = x.unsqueeze(0)
-    elif x.dim() == 2:
-        x = x.unsqueeze(0).unsqueeze(0)
-    else:
-        raise RuntimeError(f"Unexpected mel shape {tuple(x.shape)}")
-
-    x = x.to(DEVICE)
-    return x
+mel_tf = torchaudio.transforms.MelSpectrogram(
+    sample_rate=config.sr,
+    n_fft=config.n_fft,
+    hop_length=config.hop_length,
+    f_min=config.fmin,
+    f_max=config.fmax,
+    n_mels=config.n_mels,
+    power=2.0,
+)
+to_db = torchaudio.transforms.AmplitudeToDB(stype="power")
 
 
-def _topk_from_logits(
-    logits: torch.Tensor, k: int
-) -> Tuple[List[int], List[float]]:
-    probs = torch.softmax(logits, dim=1)
-    k = min(k, probs.size(1))
-    s, i = torch.topk(probs, k=k, dim=1)
-    return i[0].tolist(), [float(v) for v in s[0].tolist()]
+def pre_emphasis(x: torch.Tensor, a: float) -> torch.Tensor:
+    return torch.cat([x[:, :1], x[:, 1:] - a * x[:, :-1]], dim=1)
 
 
-# ------------------------------ Schemas ------------------------------ #
-class PredictB64Request(BaseModel):
-    audio_b64: str
-    top_k: int = 2
+def logmel_window(x: torch.Tensor) -> torch.Tensor:
+    # x: [1, T_win]
+    x = pre_emphasis(x, 0.97)
+    spec = to_db(mel_tf(x))
+    spec = (spec - spec.mean()) / (spec.std() + 1e-6)
+    return spec.unsqueeze(0)
+
+
+def make_windows(x: torch.Tensor, sr: int, win_s: float, hop_s: float):
+    T = x.shape[1]
+    win = int(sr * win_s)
+    hop = max(1, int(sr * hop_s))
+    if T <= win:
+        rep = math.ceil(win / T)
+        xx = x.repeat(1, rep)[:, :win]
+        return [(0.0, xx)]
+    windows = []
+    t = 0
+    while t + win <= T:
+        windows.append((t / sr, x[:, t : t + win]))
+        t += hop
+    if windows and windows[-1][0] * sr + win < T:
+        windows.append(((T - win) / sr, x[:, T - win : T]))
+    return windows
+
+
+# --------------------
+# API models
+# --------------------
+class ClassProb(BaseModel):
+    label: str
+    prob: float
+
+
+class BestWindow(BaseModel):
+    p_clap: float
+    t: float
+
+
+class TimelineEntry(BaseModel):
+    t: float
+    p_clap: float
+    p_noise: float
 
 
 class PredictResponse(BaseModel):
-    top_indices: List[int]
-    top_scores: List[float]
-    top_labels: Optional[List[str]] = None
+    filename: str
+    label2idx: Dict[str, int]
+    clap_idx: int
+    threshold: float
+    best: BestWindow
+    top_k: List[ClassProb]
+    timeline: List[TimelineEntry]
+    num_windows: int
 
 
-# ----------------------------- App state ----------------------------- #
-model: Optional[nn.Module] = None
-cfg: dict = {}
-labels: Optional[List[str]] = None
-mel_tx = None
-db_tx = None
+# --------------------
+# Inference helper (mirrors script's model build + inference)
+# --------------------
+DEFAULT_THRESHOLD = 0.5
+DEFAULT_CKPT_PATH = Path(os.getenv("CKPT_PATH", "best_clap_cnn.pt"))
 
 
-@app.on_event("startup")
-def _startup():
-    global model, cfg, labels, mel_tx, db_tx
-    m, c, labs = _load_checkpoint_and_model(CKPT_PATH)
-    model, cfg, labels = m, c, labs
-    mel_tx, db_tx = _build_mel_and_db(cfg)
+def infer_path(
+    wav_path: Path,
+    ckpt_path: Path = DEFAULT_CKPT_PATH,
+    threshold: float = DEFAULT_THRESHOLD,
+):
+    # Build + load model exactly as in the script
+    ckpt = torch.load(str(ckpt_path), map_location=config.device)
+    model = SmallCNN(config.n_mels, 2).to(config.device)
+    model.load_state_dict(ckpt["model"] if "model" in ckpt else ckpt)
+    model.eval()
 
+    label2idx = ckpt.get("label2idx", {"noise": 0, "clap": 1})
+    clap_idx = label2idx.get("clap", 1)
 
-# ---------------------------- Endpoints ----------------------------- #
-@app.get("/health")
-def health():
+    x = load_mono(wav_path, config.sr)
+
+    # Note: mirrors the script call exactly, including the hop argument
+    wins = make_windows(x, config.sr, config.duration_s, config.hop_length)
+
+    best = {"p_clap": -1.0, "t": 0.0}
+    best_probs = None  # softmax probs for the best window
+    timeline: List[TimelineEntry] = []
+
+    with torch.no_grad():
+        for t0, w in wins:
+            spec = logmel_window(w).to(config.device)
+            logits = model(spec)
+            probs = torch.softmax(logits, dim=1)[0].cpu().numpy()
+            p_clap = float(probs[clap_idx])
+            p_noise = float(probs[1 - clap_idx])
+
+            timeline.append(
+                TimelineEntry(
+                    t=round(float(t0), 3), p_clap=p_clap, p_noise=p_noise
+                )
+            )
+            if p_clap > best["p_clap"]:
+                best = {"p_clap": p_clap, "t": float(t0)}
+                best_probs = probs
+
+    if best_probs is None:
+        # Shouldn't happen but guard anyway
+        best_probs = np.array([0.0, 0.0], dtype=np.float32)
+
     return {
-        "status": "ok",
-        "device": str(DEVICE),
-        "labels": labels,
-        "sr": cfg.get("sr"),
-        "n_mels": cfg.get("n_mels"),
+        "label2idx": label2idx,
+        "clap_idx": clap_idx,
+        "threshold": threshold,
+        "best": BestWindow(p_clap=best["p_clap"], t=best["t"]),
+        "timeline": timeline[:500],  # match script's truncation
+        "num_windows": len(timeline),
+        "best_probs": best_probs,
     }
 
 
+# --------------------
+# Endpoint
+# --------------------
 @app.post("/predict", response_model=PredictResponse)
 async def predict_file(file: UploadFile = File(...), top_k: int = 2):
-    audio_bytes = await file.read()
-    wav = _wav_bytes_to_waveform(audio_bytes, expected_sr=cfg["sr"])
-    x = _waveform_to_input(wav, cfg, mel_tx, db_tx)
-    with torch.inference_mode():
-        logits = model(x)
-    idx, scr = _topk_from_logits(logits, top_k)
-    labs = [labels[i] for i in idx] if labels else None
-    return PredictResponse(top_indices=idx, top_scores=scr, top_labels=labs)
+    if top_k <= 0:
+        raise HTTPException(status_code=400, detail="top_k must be >= 1")
 
-
-@app.post("/predict_b64", response_model=PredictResponse)
-def predict_b64(req: PredictB64Request):
-    b64 = req.audio_b64
-    if "," in b64:
-        b64 = b64.split(",", 1)[1]
+    # Save uploaded bytes to a temp .wav file (torchaudio is most robust with paths)
     try:
-        audio_bytes = base64.b64decode(b64)
+        contents = await file.read()
+        if not contents:
+            raise HTTPException(status_code=400, detail="Empty file")
+
+        with NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp.write(contents)
+            tmp_path = Path(tmp.name)
+
+        # Run inference (build/load model exactly as in script)
+        if not DEFAULT_CKPT_PATH.exists():
+            raise HTTPException(
+                status_code=500,
+                detail=f"Checkpoint not found at {DEFAULT_CKPT_PATH}",
+            )
+
+        result = infer_path(tmp_path, DEFAULT_CKPT_PATH, DEFAULT_THRESHOLD)
+
+    except HTTPException:
+        # Pass through explicit HTTP errors
+        raise
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"base64 decode error: {e}")
-    wav = _wav_bytes_to_waveform(audio_bytes, expected_sr=cfg["sr"])
-    x = _waveform_to_input(wav, cfg, mel_tx, db_tx)
-    with torch.inference_mode():
-        logits = model(x)
-    idx, scr = _topk_from_logits(logits, req.top_k)
-    labs = [labels[i] for i in idx] if labels else None
-    return PredictResponse(top_indices=idx, top_scores=scr, top_labels=labs)
+        raise HTTPException(
+            status_code=500, detail=f"Inference failed: {str(e)}"
+        ) from e
+    finally:
+        # Cleanup temp file
+        try:
+            if "tmp_path" in locals() and tmp_path.exists():
+                tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    # Build top_k class probabilities from best window
+    label2idx = result["label2idx"]
+    idx2label = {v: k for k, v in label2idx.items()}
+    probs = result["best_probs"]
+    n_classes = probs.shape[0]
+    k = min(top_k, n_classes)
+
+    top = sorted(
+        [{"label": idx2label.get(i, str(i)), "prob": float(probs[i])} for i in range(n_classes)],
+        key=lambda x: x["prob"],
+        reverse=True,
+    )[:k]
+
+    top_models = [ClassProb(**t) for t in top]
+
+    return PredictResponse(
+        filename=file.filename or "uploaded.wav",
+        label2idx=label2idx,
+        clap_idx=result["clap_idx"],
+        threshold=result["threshold"],
+        best=result["best"],
+        top_k=top_models,
+        timeline=result["timeline"],
+        num_windows=result["num_windows"],
+    )
+
+
+# Optional: run with uvicorn if needed
+# python -m uvicorn app:app --host 0.0.0.0 --port 8000
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("app:app", host="0.0.0.0", port=8000)
