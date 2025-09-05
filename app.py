@@ -1,4 +1,3 @@
-# app.py
 import os
 import math
 from pathlib import Path
@@ -16,9 +15,6 @@ from config import config
 
 app = FastAPI(title="Clap CNN Inference API")
 
-# --------------------
-# Audio + feature transforms (same as script)
-# --------------------
 def load_mono(path: Path, sr: int) -> torch.Tensor:
     wav, in_sr = torchaudio.load(str(path))
     if in_sr != sr:
@@ -68,10 +64,6 @@ def make_windows(x: torch.Tensor, sr: int, win_s: float, hop_s: float):
         windows.append(((T - win) / sr, x[:, T - win : T]))
     return windows
 
-
-# --------------------
-# API models
-# --------------------
 class ClassProb(BaseModel):
     label: str
     prob: float
@@ -98,10 +90,6 @@ class PredictResponse(BaseModel):
     timeline: List[TimelineEntry]
     num_windows: int
 
-
-# --------------------
-# Inference helper (mirrors script's model build + inference)
-# --------------------
 DEFAULT_THRESHOLD = 0.5
 DEFAULT_CKPT_PATH = Path(os.getenv("CKPT_PATH", "best_clap_cnn.pt"))
 
@@ -111,7 +99,6 @@ def infer_path(
     ckpt_path: Path = DEFAULT_CKPT_PATH,
     threshold: float = DEFAULT_THRESHOLD,
 ):
-    # Build + load model exactly as in the script
     ckpt = torch.load(str(ckpt_path), map_location=config.device)
     model = SmallCNN(config.n_mels, 2).to(config.device)
     model.load_state_dict(ckpt["model"] if "model" in ckpt else ckpt)
@@ -122,11 +109,10 @@ def infer_path(
 
     x = load_mono(wav_path, config.sr)
 
-    # Note: mirrors the script call exactly, including the hop argument
     wins = make_windows(x, config.sr, config.duration_s, config.hop_length)
 
     best = {"p_clap": -1.0, "t": 0.0}
-    best_probs = None  # softmax probs for the best window
+    best_probs = None
     timeline: List[TimelineEntry] = []
 
     with torch.no_grad():
@@ -160,16 +146,11 @@ def infer_path(
         "best_probs": best_probs,
     }
 
-
-# --------------------
-# Endpoint
-# --------------------
 @app.post("/predict", response_model=PredictResponse)
 async def predict_file(file: UploadFile = File(...), top_k: int = 2):
     if top_k <= 0:
         raise HTTPException(status_code=400, detail="top_k must be >= 1")
 
-    # Save uploaded bytes to a temp .wav file (torchaudio is most robust with paths)
     try:
         contents = await file.read()
         if not contents:
@@ -179,7 +160,6 @@ async def predict_file(file: UploadFile = File(...), top_k: int = 2):
             tmp.write(contents)
             tmp_path = Path(tmp.name)
 
-        # Run inference (build/load model exactly as in script)
         if not DEFAULT_CKPT_PATH.exists():
             raise HTTPException(
                 status_code=500,
@@ -189,21 +169,18 @@ async def predict_file(file: UploadFile = File(...), top_k: int = 2):
         result = infer_path(tmp_path, DEFAULT_CKPT_PATH, DEFAULT_THRESHOLD)
 
     except HTTPException:
-        # Pass through explicit HTTP errors
         raise
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"Inference failed: {str(e)}"
         ) from e
     finally:
-        # Cleanup temp file
         try:
             if "tmp_path" in locals() and tmp_path.exists():
                 tmp_path.unlink(missing_ok=True)
         except Exception:
             pass
 
-    # Build top_k class probabilities from best window
     label2idx = result["label2idx"]
     idx2label = {v: k for k, v in label2idx.items()}
     probs = result["best_probs"]
@@ -229,9 +206,6 @@ async def predict_file(file: UploadFile = File(...), top_k: int = 2):
         num_windows=result["num_windows"],
     )
 
-
-# Optional: run with uvicorn if needed
-# python -m uvicorn app:app --host 0.0.0.0 --port 8000
 if __name__ == "__main__":
     import uvicorn
 
