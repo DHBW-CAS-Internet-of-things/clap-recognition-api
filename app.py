@@ -13,7 +13,7 @@ CKPT_PATH = BASE / "best_clap_cnn.pt" # path to the .pt file
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-app = FastAPI(title="Clap CNN Inference (checkpoint-compatible)")
+app = FastAPI(title="Clap CNN Inference")
 
 # ----------------------------- Utilities ----------------------------- #
 
