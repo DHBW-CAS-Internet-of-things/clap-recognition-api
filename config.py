@@ -24,6 +24,8 @@ class CFG:
     fmax: int = 7600
     device: str = _get_device()
     volume_level_threshold: int = 1250
+    webhook_url = "http://localhost:8080"
+    p_clap_threshold = 0.6
 
 
 config = CFG()

@@ -15,8 +15,13 @@ from pydantic import BaseModel
 from cnn import SmallCNN
 from config import config
 
+import urllib.request
+
 app = FastAPI(title="Clap CNN Inference API")
 logger = logging.getLogger(__name__)
+
+def trigger_webhook():
+    urllib.request.urlopen(config.webhook_url).read()
 
 
 def load_mono(path: Path, sr: int) -> torch.Tensor:
@@ -211,6 +216,10 @@ async def ws_stream(ws: WebSocket):
                 "p_noise": p_noise,
                 "threshold": DEFAULT_THRESHOLD
             })
+
+            if(p_clap >= config.p_clap_threshold):
+                trigger_webhook()
+
             t_blocks += 1.0
     except WebSocketDisconnect:
         logger.info("WebSocket disconnected")
@@ -223,7 +232,10 @@ async def ws_stream(ws: WebSocket):
 
 @app.post("/predict/volume")
 async def predict_level(levels: List[int]):
-    return any(l >= config.volume_level_threshold for l in levels)
+    clap_recognized = any(l >= config.volume_level_threshold for l in levels)
+    if (clap_recognized):
+        trigger_webhook()
+    return clap_recognized
 
 
 if __name__ == "__main__":
