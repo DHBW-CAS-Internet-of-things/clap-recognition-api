@@ -1,8 +1,8 @@
-import os
 import math
+import os
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Dict, List
+from typing import List
 
 import numpy as np
 import torch
@@ -41,7 +41,6 @@ def pre_emphasis(x: torch.Tensor, a: float) -> torch.Tensor:
 
 
 def logmel_window(x: torch.Tensor) -> torch.Tensor:
-    # x: [1, T_win]
     x = pre_emphasis(x, 0.97)
     spec = to_db(mel_tf(x))
     spec = (spec - spec.mean()) / (spec.std() + 1e-6)
@@ -125,7 +124,6 @@ def infer_path(
                 best_probs = probs
 
     if best_probs is None:
-        # Shouldn't happen but guard anyway
         best_probs = np.array([0.0, 0.0], dtype=np.float32)
 
     return {
