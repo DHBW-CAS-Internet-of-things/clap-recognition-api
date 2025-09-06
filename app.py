@@ -137,7 +137,7 @@ def infer_path(
     }
 
 
-@app.post("/predict")
+@app.post("/predict/frequency")
 async def predict_file(file: UploadFile = File(...), top_k: int = 2):
     if top_k <= 0:
         raise HTTPException(status_code=400, detail="top_k must be >= 1")
@@ -185,7 +185,11 @@ async def predict_file(file: UploadFile = File(...), top_k: int = 2):
     )[:k]
 
     top_models = [ClassProb(**t) for t in top]
-    return result["best"]
+    return result["best"]@app.post("/predict/frequency")
+
+@app.post("/predict/volume")
+async def predict_level(levels: List[int]):
+    return any(l > 1500 for l in levels)@app.post("/predict/volume")
 
 
 if __name__ == "__main__":
