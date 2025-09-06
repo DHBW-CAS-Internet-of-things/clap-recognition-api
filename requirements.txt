@@ -5,3 +5,4 @@ pydantic~=2.11.7
 numpy~=2.3.2
 uvicorn~=0.35.0
 python-multipart~=0.0.20
+websockets~=15.0.1
