@@ -23,6 +23,7 @@ class CFG:
     fmin: int = 60
     fmax: int = 7600
     device: str = _get_device()
+    volume_level_threshold: int = 1250
 
 
 config = CFG()

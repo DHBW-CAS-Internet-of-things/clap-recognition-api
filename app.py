@@ -189,7 +189,7 @@ async def predict_file(file: UploadFile = File(...), top_k: int = 2):
 
 @app.post("/predict/volume")
 async def predict_level(levels: List[int]):
-    return any(l > 1500 for l in levels)@app.post("/predict/volume")
+    return any(l >= config.volume_level_threshold for l in levels)
 
 
 if __name__ == "__main__":
