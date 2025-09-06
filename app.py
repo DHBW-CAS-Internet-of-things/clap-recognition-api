@@ -1,28 +1,47 @@
+import logging
 import math
 import os
 from pathlib import Path
-from tempfile import NamedTemporaryFile
 from typing import List
 
 import numpy as np
 import torch
 import torchaudio
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, HTTPException
+# NEU: WebSocket-Imports
+from fastapi import WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
 from cnn import SmallCNN
 from config import config
 
 app = FastAPI(title="Clap CNN Inference API")
+logger = logging.getLogger(__name__)
 
 
 def load_mono(path: Path, sr: int) -> torch.Tensor:
-    wav, in_sr = torchaudio.load(str(path))
-    if in_sr != sr:
-        wav = torchaudio.functional.resample(wav, in_sr, sr)
-    wav = wav.mean(dim=0, keepdim=True)
-    return wav
+    try:
+        wav, in_sr = torchaudio.load(str(path))
+        if in_sr != sr:
+            wav = torchaudio.functional.resample(wav, in_sr, sr)
+        wav = wav.mean(dim=0, keepdim=True)
+        return wav
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to load audio file: {str(e)}"
+        ) from e
 
+
+# Hilfsfunktion: Int16-PCM-Block -> Tensor (1, T) float32 [-1,1]
+def _int16_block_to_tensor_mono(block: bytes) -> torch.Tensor:
+    arr = np.frombuffer(block, dtype=np.int16).astype(np.float32) / 32768.0
+    return torch.from_numpy(arr).unsqueeze(0)
+
+
+# Lazy-Initialisierung des Modells (einmal pro Prozess)
+_model = None
+_label2idx = None
+_clap_idx = None
 
 mel_tf = torchaudio.transforms.MelSpectrogram(
     sample_rate=config.sr,
@@ -33,7 +52,22 @@ mel_tf = torchaudio.transforms.MelSpectrogram(
     n_mels=config.n_mels,
     power=2.0,
 )
+
 to_db = torchaudio.transforms.AmplitudeToDB(stype="power")
+
+
+def get_model():
+    global _model, _label2idx, _clap_idx
+    if _model is None:
+        ckpt = torch.load(str(DEFAULT_CKPT_PATH), map_location=config.device)
+        m = SmallCNN(config.n_mels, 2).to(config.device)
+        m.load_state_dict(ckpt["model"] if "model" in ckpt else ckpt)
+        m.eval()
+        _model = m
+        _label2idx = ckpt.get("label2idx", {"noise": 0, "clap": 1})
+        _clap_idx = _label2idx.get("clap", 1)
+        logger.info("Model loaded for WebSocket streaming.")
+    return _model, _label2idx, _clap_idx
 
 
 def pre_emphasis(x: torch.Tensor, a: float) -> torch.Tensor:
@@ -137,55 +171,55 @@ def infer_path(
     }
 
 
-@app.post("/predict/frequency")
-async def predict_file(file: UploadFile = File(...), top_k: int = 2):
-    if top_k <= 0:
-        raise HTTPException(status_code=400, detail="top_k must be >= 1")
-
+@app.websocket("/ws/stream")
+async def ws_stream(ws: WebSocket):
+    """
+    Erwartet binäre Frames mit Int16-PCM (mono, 16 kHz).
+    Pro empfangenem ~1s-Block wird ein Ergebnis (p_clap/p_noise) zurückgeschickt.
+    """
+    await ws.accept()
     try:
-        contents = await file.read()
-        if not contents:
-            raise HTTPException(status_code=400, detail="Empty file")
+        model, _, clap_idx = get_model()
+        t_blocks = 0.0
 
-        with NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            tmp.write(contents)
-            tmp_path = Path(tmp.name)
+        while True:
+            message = await ws.receive()
+            data = message.get("bytes", None)
+            if data is None:
+                # Textframes optional für Pings/Steuerung ignorieren
+                continue
 
-        if not DEFAULT_CKPT_PATH.exists():
-            raise HTTPException(
-                status_code=500,
-                detail=f"Checkpoint not found at {DEFAULT_CKPT_PATH}",
-            )
+            # Optional: Minimalprüfung auf erwartete Länge (1s-Block = 32000 Bytes)
+            if len(data) < 32000:
+                await ws.send_json({"error": "block_too_small", "expected_bytes": 32000, "got": len(data)})
+                continue
 
-        result = infer_path(tmp_path, DEFAULT_CKPT_PATH, DEFAULT_THRESHOLD)
+            # PCM -> Tensor -> Spec -> Modell
+            x = _int16_block_to_tensor_mono(data)  # (1, T) float32
+            spec = logmel_window(x).to(config.device)
 
-    except HTTPException:
-        raise
+            with torch.no_grad():
+                logits = model(spec)
+                probs = torch.softmax(logits, dim=1)[0].cpu().numpy()
+
+            p_clap = float(probs[clap_idx])
+            p_noise = float(probs[1 - clap_idx])
+
+            await ws.send_json({
+                "t": t_blocks,
+                "p_clap": p_clap,
+                "p_noise": p_noise,
+                "threshold": DEFAULT_THRESHOLD
+            })
+            t_blocks += 1.0
+    except WebSocketDisconnect:
+        logger.info("WebSocket disconnected")
     except Exception as e:
-        raise HTTPException(
-            status_code=500, detail=f"Inference failed: {str(e)}"
-        ) from e
-    finally:
         try:
-            if "tmp_path" in locals() and tmp_path.exists():
-                tmp_path.unlink(missing_ok=True)
-        except Exception:
-            pass
+            await ws.send_json({"error": f"{type(e).__name__}: {str(e)}"})
+        finally:
+            await ws.close()
 
-    label2idx = result["label2idx"]
-    idx2label = {v: k for k, v in label2idx.items()}
-    probs = result["best_probs"]
-    n_classes = probs.shape[0]
-    k = min(top_k, n_classes)
-
-    top = sorted(
-        [{"label": idx2label.get(i, str(i)), "prob": float(probs[i])} for i in range(n_classes)],
-        key=lambda x: x["prob"],
-        reverse=True,
-    )[:k]
-
-    top_models = [ClassProb(**t) for t in top]
-    return result["best"]@app.post("/predict/frequency")
 
 @app.post("/predict/volume")
 async def predict_level(levels: List[int]):
