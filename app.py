@@ -18,10 +18,13 @@ from config import config
 import urllib.request
 
 app = FastAPI(title="Clap CNN Inference API")
+
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 def trigger_webhook():
-    urllib.request.urlopen(config.webhook_url).read()
+    result = urllib.request.urlopen(config.webhook_url).read()
+    logger.info(result)
 
 
 def load_mono(path: Path, sr: int) -> torch.Tensor:
